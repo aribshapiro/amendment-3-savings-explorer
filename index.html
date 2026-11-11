@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Miami-Dade Amendment 3 Savings Explorer — single-file viewer</title>
+<!--
+  SINGLE-FILE VIEWER — double-click to open, no npm, no terminal, no server.
+  Built 2026-11-11 as the open-it-and-it-works fallback to the Vite app in
+  ~/workspace/amendment3-supabase-explorer/ (which needs `npm run dev`).
+  Same live sources, same verified query rules:
+    - Supabase public.savings (939,447 records) via REST. The publishable
+      key is BAKED IN below (SB_KEY) so nobody has to paste credentials.
+      That is the PUBLIC publishable (anon) key: it is designed to ship in
+      browser code, and Row Level Security (public SELECT on public.savings)
+      is what protects the data. NEVER put the service-role (secret) key here.
+    - Miami-Dade Parcelpoly polygons + PaGISView condo units (public ArcGIS).
+    - Never count=exact on filtered queries, never ORDER BY a savings
+      column, never SELECT * — those trigger the ~4s statement timeout
+      (HTTP 500) verified 2026-11-11. ZIP search 500s until the zip_code
+      index is applied; this viewer catches that and says so.
+  Map: small red dots for every eligible parcel when zoomed out (canvas
+  rendering, so thousands stay fast), dots in the middle zooms, and the
+  actual parcel polygons at zoom 16+, all coloured on the same red scale
+  (pale = small savings, deep red = large). Only geometries inside the
+  current map extent are ever fetched — the full 939,447-parcel dataset
+  is never loaded into the browser.
+  Condos: clicking a building uses its group (parent) parcel and shows a
+  "Select Condo Unit" dropdown with every unit's own savings.
+  What this viewer does NOT do (use the Vite app for these): clustered
+  points at countywide zoom, the methodology modal. It does: search,
+  click-a-parcel, condo unit dropdown + building summary, savings.
+-->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; color: #1a1a1a; }
+  header { padding: 12px 16px; background: #0b3d5c; color: #fff; }
+  header h1 { margin: 0 0 4px; font-size: 19px; }
+  header p { margin: 0; font-size: 13px; opacity: .9; }
+  #totals { display: flex; gap: 18px; flex-wrap: wrap; padding: 8px 16px; background: #eef4f7; font-size: 13px; }
+  #totals b { font-size: 15px; }
+  #status { padding: 6px 16px; font-size: 13px; min-height: 20px; }
+  #status.err { color: #a00; } #status.ok { color: #0a6b2e; }
+  #main { display: flex; flex-wrap: wrap; }
+  #left { flex: 1 1 340px; max-width: 430px; padding: 12px 16px; }
+  #mapwrap { flex: 3 1 500px; min-height: 520px; }
+  #map { height: 640px; min-height: 520px; width: 100%; }
+  #legend { padding: 8px 12px; font-size: 12px; background: #fff; border-top: 1px solid #ddd; }
+  #legend .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: middle; margin: 0 4px 0 10px; border: 1px solid #999; }
+  #search { width: 100%; padding: 9px 10px; font-size: 15px; border: 1px solid #999; border-radius: 4px; }
+  .hint { font-size: 12px; color: #555; margin: 6px 0 10px; }
+  #results { list-style: none; margin: 0; padding: 0; }
+  #results li { padding: 8px; border-bottom: 1px solid #ddd; cursor: pointer; font-size: 13px; }
+  #results li:hover { background: #eef4f7; }
+  #results li b { display: block; }
+  #panel { margin-top: 14px; border: 1px solid #ccc; border-radius: 6px; padding: 12px; font-size: 13px; display: none; max-width: 900px; }
+  #panel h2 { margin: 0 0 4px; font-size: 16px; }
+  #panel table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  #panel td { padding: 4px 0; border-bottom: 1px solid #eee; vertical-align: top; }
+  #panel td:first-child { color: #555; width: 46%; }
+  .big { font-size: 18px; font-weight: 700; }
+  .eligible { color: #0a6b2e; font-weight: 700; } .inelig { color: #a00; font-weight: 700; }
+  #condoSel { width: 100%; padding: 7px; margin-top: 8px; font-size: 14px; }
+  footer { padding: 10px 16px; font-size: 11px; color: #666; }
+  /* Loading screen: covers the page while the first parcels render behind it. */
+  #loader { position: fixed; inset: 0; background: #fff; z-index: 9999; display: flex; align-items: center; justify-content: center; transition: opacity .45s ease; }
+  #loader .box { text-align: center; }
+  #loader .spin { width: 44px; height: 44px; margin: 0 auto 16px; border: 4px solid #dfe8ec; border-top-color: #0b3d5c; border-radius: 50%; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loader .t { font-size: 20px; font-weight: 700; color: #0b3d5c; }
+  #loader .s { font-size: 13px; color: #666; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="loader"><div class="box"><div class="spin"></div><div class="t">Connecting&hellip;</div><div class="s">Loading Miami-Dade parcels&hellip;</div></div></div>
+<script>
+  // Never trap the user on the loading screen. This runs on its own, so it
+  // fires even if the main script below fails or the data hangs: after 10s
+  // the loader fades out no matter what.
+  setTimeout(function () {
+    var el = document.getElementById("loader");
+    if (el && el.style.display !== "none") {
+      el.style.opacity = "0";
+      setTimeout(function () { el.style.display = "none"; }, 500);
+    }
+  }, 10000);
+</script>
+<header>
+  <h1>Miami-Dade Amendment 3 Savings Explorer</h1>
+  <p>Estimated property tax savings by parcel &mdash; click the map or search an address or folio.</p>
+</header>
+<div id="totals">
+  <span>Parcels: <b>939,447</b></span>
+  <span>Amendment 3 eligible: <b>451,610</b></span>
+  <span>Est. 2027 savings: <b>$434,546,387</b></span>
+  <span>Est. 2028 savings: <b>$745,605,053</b></span>
+  <span>Two-year total: <b>$1,180,151,440</b></span>
+</div>
+<div id="status">Connecting&hellip;</div>
+<div id="main">
+  <div id="left">
+    <input id="search" type="text" placeholder="Search folio, address, city, or ZIP" autocomplete="off">
+    <div class="hint">Folio with or without dashes, a street address, a city, or a 5-digit ZIP. Zoomed out: eligible parcels as dots &middot; zoom to 16+: parcel boundaries.</div>
+    <ul id="results"></ul>
+  </div>
+  <div id="mapwrap">
+    <div id="map"></div>
+    <div id="legend"><b>Two-year estimated savings:</b>
+      <span class="sw" style="background:#c9c9c9"></span>$0 / not eligible
+      <span class="sw" style="background:#fee5d9"></span>$1&ndash;$1,500
+      <span class="sw" style="background:#fcae91"></span>$1,500&ndash;$2,500
+      <span class="sw" style="background:#fb6a4a"></span>$2,500&ndash;$3,500
+      <span class="sw" style="background:#de2d26"></span>$3,500&ndash;$5,000
+      <span class="sw" style="background:#a50f15"></span>$5,000+
+    </div>
+    <div id="panel"></div>
+  </div>
+</div>
+<footer>Estimates based on 2026 assessment data from the Miami-Dade Property Appraiser, statutory homestead exemption amounts, and 2026 adopted millage rates used as a proxy for future rates. School taxes and non-homestead assessment cap changes are not included. Final amounts depend on the Legislature&rsquo;s implementing law, the certified 2027 roll, and 2027 millage rates. Not tax advice. Parcel boundaries: Miami-Dade County Parcelpoly ArcGIS service. Condo units: PaGISView (folio-prefix + CONDO_FLAG=&lsquo;Y&rsquo;, verified on three buildings).</footer>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function () {
+  "use strict";
+  // --- Supabase connection: publishable key baked in (public by design; RLS protects the data). ---
+  var SB_URL = "https://rxjvptbolbzvtnxbyymh.supabase.co";
+  var SB_KEY = "sb_publishable_GYzu_Ewc32m5xYKeMiaBlg_8UEAuVrK";
+  var PARCELPOLY = "https://services.arcgis.com/8Pc9XBTAsYuxx9Ny/arcgis/rest/services/Parcelpoly_gdb/FeatureServer/0";
+  var PAGISVIEW = "https://services.arcgis.com/8Pc9XBTAsYuxx9Ny/ArcGIS/rest/services/PaGISView_gdb/FeatureServer/0";
+  var SEARCH_COLS = "folio,site_address,address_line_2,city,zip_code,tax_district,amendment3_eligible,est_savings_2027,est_savings_2028,two_year_estimated_savings";
+  var DETAIL_COLS = "folio,tax_authority_code,tax_district,site_address,address_line_2,city,zip_code,land_use_code,property_appraiser_use_code,homestead,market_value,assessed_value_school,assessed_value_nonschool,taxable_value_school,taxable_value_nonschool,homestead_exemption,additional_homestead_exemption,current_nonschool_homestead_exemption,amendment3_eligible,eligibility_basis,total_millage_2026,school_millage,nonschool_millage,millage_rate_basis_year,est_savings_2027,est_savings_2028,two_year_estimated_savings,calculation_status";
+
+  var $ = function (id) { return document.getElementById(id); };
+  var statusEl = $("status"), panelEl = $("panel"), resultsEl = $("results");
+  var map, parcelLayer = null, viewportLayer = null, loadingLayer = null, viewportTimer = null, lastViewportKey = "", canvasRenderer = null;
+
+  function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ""; }
+  // Loading screen: hides (fades out) the first time parcels actually
+  // render, so the user never stares at an empty map. The data keeps
+  // loading behind it — the overlay is purely visual.
+  var loaderHidden = false;
+  function hideLoader() {
+    if (loaderHidden) return;
+    loaderHidden = true;
+    var el = document.getElementById("loader");
+    if (!el) return;
+    el.style.opacity = "0";
+    setTimeout(function () { el.style.display = "none"; }, 500);
+  }
+  function money(n) { return (n == null || isNaN(n)) ? "—" : "$" + Number(n).toLocaleString("en-US", { maximumFractionDigits: 2 }); }
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  function digits(s) { return String(s || "").replace(/\D/g, ""); }
+
+  // Two-year estimated savings -> fill colour (same scale for points and polygons).
+  function savingsColor(twoYear, eligible) {
+    if (!eligible || twoYear == null || Number(twoYear) <= 0) return "#c9c9c9";
+    var v = Number(twoYear);
+    if (v < 1500) return "#fee5d9";
+    if (v < 2500) return "#fcae91";
+    if (v < 3500) return "#fb6a4a";
+    if (v < 5000) return "#de2d26";
+    return "#a50f15";
+  }
+  // Taxable value removed, computed in-app so it always matches the savings
+  // (the stored amendment3_exemption_amount_* columns are uncapped increments).
+  function removed(assessed, current, target) {
+    if (assessed == null || current == null) return null;
+    return Math.max(0, Math.min(Number(assessed), target) - Number(current));
+  }
+
+  function sb() { return { url: SB_URL, key: SB_KEY }; }
+  async function sbFetch(path) {
+    var c = sb();
+    var ctl = new AbortController(); var t = setTimeout(function () { ctl.abort(); }, 20000);
+    try {
+      var r = await fetch(c.url + "/rest/v1/" + path, { headers: { apikey: c.key, Authorization: "Bearer " + c.key }, signal: ctl.signal });
+      if (!r.ok) { var txt = ""; try { txt = await r.text(); } catch (e) {}
+        throw new Error("Supabase HTTP " + r.status + (r.status === 500 ? " — statement timeout. Try a narrower search (folio or address)." : "") + (txt ? " " + txt.slice(0, 200) : "")); }
+      return await r.json();
+    } finally { clearTimeout(t); }
+  }
+  async function arcgis(base, params) {
+    var u = new URL(base + "/query");
+    Object.keys(params).forEach(function (k) { u.searchParams.set(k, String(params[k])); });
+    var ctl = new AbortController(); var t = setTimeout(function () { ctl.abort(); }, 20000);
+    try {
+      var r = await fetch(u.toString(), { signal: ctl.signal });
+      if (!r.ok) throw new Error("ArcGIS HTTP " + r.status);
+      var d = await r.json();
+      if (d.error) throw new Error("ArcGIS: " + (d.error.message || "query failed"));
+      return d;
+    } finally { clearTimeout(t); }
+  }
+
+  // --- map ---
+  function initMap() {
+    map = L.map("map").setView([25.75, -80.3], 10);
+    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}", {
+      attribution: "Esri, HERE, Garmin, OpenStreetMap contributors", maxZoom: 19
+    }).addTo(map);
+    viewportLayer = L.layerGroup().addTo(map);
+    loadingLayer = L.layerGroup().addTo(map);
+    canvasRenderer = L.canvas();
+    map.on("click", onMapClick);
+    map.on("moveend", scheduleViewport);
+    scheduleViewport();
+  }
+  function ringsToLatLngs(rings) {
+    return rings.map(function (ring) { return ring.map(function (p) { return [p[1], p[0]]; }); });
+  }
+  function highlightParcel(rings, color) {
+    if (parcelLayer) { map.removeLayer(parcelLayer); parcelLayer = null; }
+    if (!rings || !rings.length) return;
+    var c = color || "#ffd400";
+    parcelLayer = L.polygon(ringsToLatLngs(rings), { color: c, weight: 4, fillColor: c, fillOpacity: 0.35 }).addTo(map);
+    map.fitBounds(parcelLayer.getBounds().pad(0.3));
+  }
+
+  // One envelope query against Parcelpoly. Returns the parsed response.
+  async function queryParcels(envStr, wantPoly, limit) {
+    return arcgis(PARCELPOLY, {
+      geometry: envStr,
+      geometryType: "esriGeometryEnvelope", spatialRel: "esriSpatialRelIntersects",
+      inSR: 4326, // REQUIRED: without this the service reads the 4326 lon/lat
+      // envelope as Web Mercator metres and returns zero features.
+      outFields: "FOLIO,CONDOFLG", returnGeometry: wantPoly, returnCentroid: !wantPoly,
+      outSR: 4326, resultRecordCount: limit, orderByFields: "OBJECTID", f: "json"
+    });
+  }
+
+  // Cache of folio -> { amendment3_eligible, two_year_estimated_savings }.
+  // Panning back over ground already loaded reuses it instead of re-fetching.
+  var savCache = {};
+  async function getSavings(folios) {
+    var missing = folios.filter(function (f) { return !(f in savCache); });
+    var chunks = [];
+    for (var i = 0; i < missing.length; i += 500) chunks.push(missing.slice(i, i + 500));
+    var results = await Promise.all(chunks.map(function (chunk) {
+      return sbFetch("savings?select=folio,amendment3_eligible,two_year_estimated_savings&folio=in.(" + chunk.map(function (f) { return '"' + f + '"'; }).join(",") + ")&limit=500").catch(function () { return []; });
+    }));
+    results.forEach(function (rows) { rows.forEach(function (r) { savCache[r.folio] = r; }); });
+    var out = {};
+    folios.forEach(function (f) { if (savCache[f]) out[f] = savCache[f]; });
+    return out;
+  }
+  function drawFeats(feats, wantPoly, dense) {
+    if (dense && !canvasRenderer) canvasRenderer = L.canvas();
+    feats.forEach(function (f) {
+      var a = f.attributes || {};
+      var s = savCache[a.FOLIO] || {};
+      // At the first view only eligible parcels get a dot.
+      if (dense && !s.amendment3_eligible) return;
+      var col = savingsColor(s.two_year_estimated_savings, s.amendment3_eligible);
+      if (wantPoly && f.geometry && f.geometry.rings) {
+        L.polygon(ringsToLatLngs(f.geometry.rings), { color: "#0b3d5c", weight: 1, fillColor: col, fillOpacity: 0.75 })
+          .addTo(viewportLayer).on("click", function (e) { if (e.originalEvent) e.originalEvent.stopPropagation(); showFolio(String(a.FOLIO)); });
+      } else if (f.centroid) {
+        L.circleMarker([f.centroid.y, f.centroid.x], {
+          radius: dense ? 2 : 4, color: "#0b3d5c", weight: dense ? 0 : 1, fillColor: col, fillOpacity: 0.9,
+          renderer: dense ? canvasRenderer : undefined
+        }).addTo(viewportLayer).on("click", function (e) { if (e.originalEvent) e.originalEvent.stopPropagation(); showFolio(String(a.FOLIO)); });
+      }
+    });
+    if (viewportLayer.getLayers().length) hideLoader();
+  }
+
+  // --- viewport: small eligible dots zoomed out, polygons zoomed in ---
+  // Zoom < 12: a dense field of small dots for every eligible parcel the
+  // viewport query returns (4x4 grid, 500 per cell, up to ~8,000 parcels;
+  // roughly half are eligible). Zoom 12–15: the same grid, dots for every
+  // parcel (radius 4). Zoom 16+: the actual parcel polygons. All dots and
+  // polygons are coloured by two-year savings on the red scale. Rendered
+  // on canvas so thousands of dots stay fast. The grid split matters: a
+  // single query returns the first N by OBJECTID, which clusters in one
+  // corner, so the cells spread the dots evenly — the middle zooms used a
+  // single query before and showed nothing over most of the viewport.
+  function scheduleViewport() { clearTimeout(viewportTimer); viewportTimer = setTimeout(loadViewport, 400); }
+  async function loadViewport() {
+    if (!map) return;
+    var z = map.getZoom();
+    var b = map.getBounds();
+    var key = [z, b.getWest().toFixed(3), b.getSouth().toFixed(3), b.getEast().toFixed(3), b.getNorth().toFixed(3)].join("|");
+    if (key === lastViewportKey) return; lastViewportKey = key;
+    var myKey = key;
+    viewportLayer.clearLayers();
+    loadingLayer.clearLayers();
+    try {
+      var wantPoly = z >= 16;
+      var dense = z < 12; // dense eligible-only dot field at the first view
+      var exceeded = false;
+      if (wantPoly) {
+        var d = await queryParcels([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(","), wantPoly, 500);
+        if (myKey !== lastViewportKey) return; // user panned on; drop this stale load
+        var feats = d.features || [];
+        exceeded = !!d.exceededTransferLimit;
+        if (feats.length) {
+          var folios = feats.map(function (f) { return f.attributes.FOLIO; }).filter(Boolean);
+          await getSavings(folios);
+          if (myKey !== lastViewportKey) return;
+          drawFeats(feats, wantPoly, dense);
+        }
+      } else {
+        // Grid for every dot zoom (both the dense <12 view and the middle
+        // 12–15 view). A single query returns only the first 500 by
+        // OBJECTID, which clusters in one corner and leaves the rest of
+        // the viewport empty — the grid spreads the dots evenly.
+        var stepX = (b.getEast() - b.getWest()) / 4, stepY = (b.getNorth() - b.getSouth()) / 4;
+        var cells = [];
+        for (var gx = 0; gx < 4; gx++) {
+          for (var gy = 0; gy < 4; gy++) {
+            cells.push([b.getWest() + gx * stepX, b.getSouth() + gy * stepY, b.getWest() + (gx + 1) * stepX, b.getSouth() + (gy + 1) * stepY]);
+          }
+        }
+        // Each cell draws as soon as its own parcels arrive — neutral dots
+        // from the geometry first (ArcGIS only, ~1s), then the savings
+        // recolor them a moment later. So the user sees dots almost
+        // immediately instead of waiting on the Supabase lookup + cold start.
+        await Promise.all(cells.map(async function (c) {
+          var loadingGroup = null;
+          try {
+            var cd = await queryParcels(c.join(","), false, 500);
+            if (myKey !== lastViewportKey) return;
+            var cfeats = cd.features || [];
+            if (!cfeats.length) return;
+            exceeded = exceeded || !!cd.exceededTransferLimit;
+            // Neutral placeholder dots, drawn now from geometry alone.
+            loadingGroup = L.layerGroup();
+            cfeats.forEach(function (f) {
+              if (f.centroid) {
+                L.circleMarker([f.centroid.y, f.centroid.x], {
+                  radius: dense ? 2 : 4, color: "#0b3d5c", weight: 0, fillColor: "#b0b8bc", fillOpacity: 0.7,
+                  renderer: canvasRenderer
+                }).addTo(loadingGroup);
+              }
+            });
+            loadingGroup.addTo(loadingLayer);
+            hideLoader();
+            var cfolios = cfeats.map(function (f) { return f.attributes.FOLIO; }).filter(Boolean);
+            await getSavings(cfolios);
+            if (myKey !== lastViewportKey) { loadingLayer.removeLayer(loadingGroup); return; }
+            // Savings are in: drop this cell's placeholders, draw the real dots.
+            loadingLayer.removeLayer(loadingGroup);
+            drawFeats(cfeats, false, dense);
+          } catch (e) {
+            if (loadingGroup) loadingLayer.removeLayer(loadingGroup);
+            /* one bad cell doesn't block the rest */
+          }
+        }));
+      }
+      if (myKey !== lastViewportKey) return;
+      if (exceeded) setStatus("Showing the first parcels in view — zoom in to see more.", "");
+    } catch (e) { /* viewport layers are best-effort; search and click still work */ }
+  }
+
+  // --- search ---
+  var searchTimer = null;
+  $("search").addEventListener("input", function () {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(function () { runSearch($("search").value.trim()); }, 350);
+  });
+  async function runSearch(q) {
+    resultsEl.innerHTML = ""; if (!q) return;
+    setStatus("Searching…", "");
+    try {
+      var rows, d = digits(q);
+      if (d.length === 13) {
+        rows = await sbFetch("savings?select=" + SEARCH_COLS + "&folio=eq." + d + "&limit=5");
+      } else if (/^\d{5}$/.test(q)) {
+        try {
+          rows = await sbFetch("savings?select=" + SEARCH_COLS + "&zip_code=eq." + q + "&order=folio.asc&limit=20");
+        } catch (e) {
+          setStatus("ZIP search hit the database timeout (the zip_code index is not applied yet). Try a folio or street address instead.", "err");
+          return;
+        }
+      } else if (q.length >= 3) {
+        rows = await sbFetch("savings?select=" + SEARCH_COLS + "&site_address=ilike.*" + encodeURIComponent(q) + "*&order=folio.asc&limit=20");
+        if (!rows.length) {
+          // Retry with just the part before the first comma (street address without city/ZIP).
+          var first = q.split(",")[0].trim();
+          if (first && first !== q) rows = await sbFetch("savings?select=" + SEARCH_COLS + "&site_address=ilike.*" + encodeURIComponent(first) + "*&order=folio.asc&limit=20");
+        }
+        if (!rows.length) rows = await sbFetch("savings?select=" + SEARCH_COLS + "&city=ilike." + encodeURIComponent(q) + "&order=folio.asc&limit=20");
+      } else { setStatus("Type at least 3 characters.", ""); return; }
+      if (!rows.length) { setStatus("No matches for “" + q + "”. Try a folio or a partial street address.", ""); return; }
+      setStatus(rows.length + " match" + (rows.length > 1 ? "es" : "") + " — click one to open it.", "ok");
+      rows.forEach(function (r) {
+        var li = document.createElement("li");
+        li.innerHTML = "<b>" + esc(r.site_address || "(no address)") + (r.address_line_2 ? " " + esc(r.address_line_2) : "") + "</b>" +
+          esc(r.city || "") + " " + esc(r.zip_code || "") + " · folio " + esc(r.folio) +
+          " · 2027 " + money(r.est_savings_2027) + " · 2028 " + money(r.est_savings_2028);
+        li.addEventListener("click", function () { showFolio(r.folio); });
+        resultsEl.appendChild(li);
+      });
+      if (rows.length === 1) showFolio(rows[0].folio);
+    } catch (e) { setStatus("Search failed: " + e.message, "err"); }
+  }
+
+  // --- parcel detail + condo dropdown ---
+  // A folio may be a single parcel or one unit of a condo building. Either way
+  // the GROUP (building) parcel — first 9 folio digits + "0001" — is what
+  // carries the polygon and the CONDOFLG, and its units come from PaGISView.
+  async function showFolio(folio) {
+    setStatus("Loading folio " + folio + "…", "");
+    try {
+      var rows = await sbFetch("savings?select=" + DETAIL_COLS + "&folio=eq." + folio + "&limit=1");
+      var buildingFolio = folio.slice(0, 9) + "0001";
+      // Try the parcel's own folio first (regular parcels); fall back to the
+      // building folio (condo units have no polygon of their own — only the
+      // building does). The old code only tried the building folio, so
+      // regular parcels never highlighted.
+      var parcel = null;
+      try {
+        var pd = await arcgis(PARCELPOLY, { where: "FOLIO='" + folio + "'", outFields: "OBJECTID,FOLIO,CONDOFLG", returnGeometry: true, outSR: 4326, f: "json" });
+        parcel = (pd.features && pd.features[0]) || null;
+        if (!parcel && buildingFolio !== folio) {
+          var bd = await arcgis(PARCELPOLY, { where: "FOLIO='" + buildingFolio + "'", outFields: "OBJECTID,FOLIO,CONDOFLG", returnGeometry: true, outSR: 4326, f: "json" });
+          parcel = (bd.features && bd.features[0]) || null;
+        }
+      } catch (e) {}
+      var condoFlag = parcel ? String(parcel.attributes.CONDOFLG || "N") : null;
+      if (parcel && parcel.geometry && parcel.geometry.rings) highlightParcel(parcel.geometry.rings);
+      if (!rows.length) {
+        if (condoFlag === "C") {
+          panelEl.style.display = "block";
+          panelEl.innerHTML = "<h2>Condominium building</h2><div>Folio " + esc(buildingFolio) + "</div><div id='condoBox'></div>";
+          loadCondoUnits(buildingFolio, null);
+          setStatus("This is a condominium building — pick a unit.", "");
+        } else {
+          setStatus("No savings record for folio " + folio + ".", "err");
+        }
+        return;
+      }
+      var r = rows[0];
+      renderPanel(r, condoFlag);
+      if (condoFlag === "C") loadCondoUnits(buildingFolio, folio);
+      setStatus("Loaded " + (r.site_address || folio) + ".", "ok");
+    } catch (e) { setStatus("Could not load folio: " + e.message, "err"); }
+  }
+  function renderPanel(r, condoFlag) {
+    // Save Our Homes cap assessment reduction = market value minus the
+    // (already capped) assessed value. The Supabase table has no SOH column,
+    // but the PA reports exactly this difference (folio 0351050060180:
+    // $21,589,068 − $19,769,750 = $1,819,318). Only applies to homesteads.
+    var soh = null;
+    if (r.homestead && r.market_value != null && r.assessed_value_nonschool != null) {
+      soh = Math.max(0, Number(r.market_value) - Number(r.assessed_value_nonschool));
+    }
+    var rows = [
+      ["Address", esc(r.site_address || "—") + (r.address_line_2 ? " " + esc(r.address_line_2) : "")],
+      ["Folio", esc(r.folio)], ["City / ZIP", esc(r.city || "—") + " " + esc(r.zip_code || "")],
+      ["Tax district", esc(r.tax_district || "—")], ["Land-use code", esc(r.land_use_code || "—")],
+      ["PA use code", esc(r.property_appraiser_use_code || "—")],
+      ["Homestead", r.homestead ? "Yes" : "No"],
+      ["Market value", money(r.market_value)],
+      ["Assessed (school / non-school)", money(r.assessed_value_school) + " / " + money(r.assessed_value_nonschool)],
+      (soh == null ? null : ["Save Our Homes cap assessment reduction", money(soh)]),
+      ["Taxable (school / non-school)", money(r.taxable_value_school) + " / " + money(r.taxable_value_nonschool)],
+      ["Current homestead exemption", money(r.homestead_exemption)],
+      ["Taxable value removed — 2027", money(removed(r.assessed_value_nonschool, r.current_nonschool_homestead_exemption, 150000))],
+      ["Taxable value removed — 2028", money(removed(r.assessed_value_nonschool, r.current_nonschool_homestead_exemption, 250000))],
+      ["Non-school millage (2026)", r.nonschool_millage == null ? "—" : Number(r.nonschool_millage).toFixed(3)],
+      ["Eligibility basis", esc(r.eligibility_basis || "—")]
+    ];
+    panelEl.style.display = "block";
+    panelEl.innerHTML =
+      "<h2>" + esc(r.site_address || "Property") + "</h2>" +
+      "<div>Folio " + esc(r.folio) + " · " + esc(r.city || "") + "</div>" +
+      "<div style='margin-top:8px'>Amendment 3: " + (r.amendment3_eligible
+        ? "<span class='eligible'>Eligible</span>"
+        : "<span class='inelig'>Not eligible</span>") + "</div>" +
+      "<div style='margin-top:6px'>2027 savings <span class='big'>" + money(r.est_savings_2027) + "</span> &nbsp;·&nbsp; " +
+      "2028 <span class='big'>" + money(r.est_savings_2028) + "</span><br>" +
+      "Two-year total <b>" + money(r.two_year_estimated_savings) + "</b></div>" +
+      "<div id='condoBox'></div>" +
+      "<table>" + rows.filter(function (x) { return x; }).map(function (x) { return "<tr><td>" + x[0] + "</td><td>" + x[1] + "</td></tr>"; }).join("") + "</table>";
+  }
+  async function loadCondoUnits(buildingFolio, selectedFolio) {
+    var box = $("condoBox"); if (!box) return;
+    box.innerHTML = "<p>Condominium building — loading units…</p>";
+    try {
+      var prefix = buildingFolio.slice(0, 9);
+      var d = await arcgis(PAGISVIEW, {
+        where: "FOLIO LIKE '" + prefix + "%' AND CONDO_FLAG='Y'",
+        outFields: "FOLIO,TRUE_SITE_UNIT,TRUE_SITE_ADDR_NO_UNIT",
+        returnGeometry: false, orderByFields: "FOLIO", resultRecordCount: 2000, f: "json"
+      });
+      var units = d.features || [];
+      if (!units.length) { box.innerHTML = "<p>Condo building, but no unit list returned. Search a unit by its folio or address instead.</p>"; return; }
+      // Ascending by unit number (numeric, not lexicographic — "9" before "10").
+      units.sort(function (x, y) {
+        function num(f) { var m = String((f.attributes || {}).TRUE_SITE_UNIT || "").match(/^\d+/); return m ? parseInt(m[0], 10) : null; }
+        var nx = num(x), ny = num(y);
+        if (nx != null && ny != null) return nx - ny;
+        if (nx != null) return -1;
+        if (ny != null) return 1;
+        return String((x.attributes || {}).TRUE_SITE_UNIT || "").localeCompare(String((y.attributes || {}).TRUE_SITE_UNIT || ""));
+      });
+      var folios = units.map(function (f) { return f.attributes.FOLIO; });
+      var sav = {};
+      var chunks = [];
+      for (var i = 0; i < folios.length; i += 100) chunks.push(folios.slice(i, i + 100));
+      var results = await Promise.all(chunks.map(function (chunk) {
+        return sbFetch("savings?select=folio,homestead,est_savings_2027&folio=in.(" + chunk.map(function (f) { return '"' + f + '"'; }).join(",") + ")&limit=100").catch(function () { return []; });
+      }));
+      results.forEach(function (rows) { rows.forEach(function (r) { sav[r.folio] = r; }); });
+      var homesteaded = 0, total27 = 0, withSav = 0;
+      folios.forEach(function (f) { var s = sav[f]; if (s) { if (s.homestead) homesteaded++; if (s.est_savings_2027 != null) { total27 += Number(s.est_savings_2027); withSav++; } } });
+      var avg27 = withSav ? total27 / withSav : 0;
+      var sel = document.createElement("select"); sel.id = "condoSel";
+      var opt0 = document.createElement("option"); opt0.value = ""; opt0.textContent = "Select Condo Unit — " + units.length + " units"; sel.appendChild(opt0);
+      units.forEach(function (f) {
+        var a = f.attributes || {};
+        var s = sav[a.FOLIO] || {};
+        var o = document.createElement("option");
+        o.value = a.FOLIO;
+        o.textContent = "Unit " + (a.TRUE_SITE_UNIT || "?") + " — " + money(s.est_savings_2027) + " in 2027 (" + a.FOLIO + ")";
+        sel.appendChild(o);
+      });
+      if (selectedFolio) sel.value = selectedFolio;
+      sel.addEventListener("change", function () { if (sel.value) showFolio(sel.value); });
+      box.innerHTML = "<p><b>This is a condominium building.</b> Pick a unit — the savings shown always belong to the selected unit, never the building total.</p>" +
+        "<p>" + units.length + " units · " + homesteaded + " homesteaded · total 2027 savings " + money(total27) + " · average " + money(avg27) + " per unit.</p>";
+      box.appendChild(sel);
+    } catch (e) { box.innerHTML = "<p>Could not load the unit list: " + esc(e.message) + "</p>"; }
+  }
+  async function onMapClick(e) {
+    setStatus("Looking up the parcel you clicked…", "");
+    try {
+      var d = await arcgis(PARCELPOLY, {
+        geometry: e.latlng.lng + "," + e.latlng.lat, geometryType: "esriGeometryPoint", inSR: 4326,
+        spatialRel: "esriSpatialRelIntersects", outFields: "FOLIO,CONDOFLG",
+        returnGeometry: false, f: "json"
+      });
+      var f = d.features && d.features[0];
+      if (!f || !f.attributes || !f.attributes.FOLIO) { setStatus("No parcel at that spot — try clicking a building or lot.", ""); return; }
+      showFolio(String(f.attributes.FOLIO));
+    } catch (err) { setStatus("Parcel lookup failed: " + err.message, "err"); }
+  }
+
+  // --- auto-connect on load (key is baked in; no input needed) ---
+  async function connectTest() {
+    setStatus("Connecting… (first request can take ~10s)", "");
+    try {
+      var rows = await sbFetch("savings?select=folio,site_address,est_savings_2027&folio=eq.0141100640950&limit=1");
+      if (rows.length && Number(rows[0].est_savings_2027) > 0) {
+        setStatus("Connected — 939,447 records live. Test folio 0141100640950: " + money(rows[0].est_savings_2027) + " in 2027. Search or click the map.", "ok");
+      } else setStatus("Connected, but the test folio came back empty.", "err");
+    } catch (e) { setStatus("Connection failed: " + e.message, "err"); hideLoader(); }
+  }
+
+  initMap();
+  connectTest();
+  // Safety net: never leave the loading screen up forever.
+  setTimeout(hideLoader, 15000);
+})();
+</script>
+</body>
+</html>
